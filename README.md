@@ -1,16 +1,16 @@
 # NetScope // Tailscale Demo
 
-> **A human + AI collaboration.** This project was built as a pair with [Claude](https://claude.ai) (Anthropic) to demonstrate what Tailscale makes possible. The scanner, the server, the UI, and this README were all written together in conversation — a real example of what human curiosity and AI capability can produce when pointed at an interesting problem.
+> **Credit where due** This project was built as a pair with [Claude](https://claude.ai) (Anthropic) to demonstrate what Tailscale makes possible.
 
-A live network scanner you can access from your phone, a coffee shop, or the other side of the world — privately, instantly, with no setup beyond installing Tailscale.
+This is live network scanner you can access from your phone, a coffee shop, or the other side of the world — privately, instantly, with no setup beyond installing Tailscale.
 
 ---
 
 ## Seen in the Wild
 
-*Screenshot taken on iPhone, connected from a different network via Tailscale — scanning the home LAN where the PC is running:*
+*Screenshot taken on my iPhone, connected from a different network via Tailscale — scanning the home LAN where the PC is running:*
 
-![NetScope running on iPhone over Tailscale](https://jennings-farmhouse.s3.us-east-1.amazonaws.com/night.jpg)
+![NetScope running on iPhone over Tailscale](https://joelodom.s3.us-east-1.amazonaws.com/IMG_7373.png)
 
 ---
 
@@ -18,9 +18,9 @@ A live network scanner you can access from your phone, a coffee shop, or the oth
 
 Here's the actual setup used to build and test this — three devices on three different networks, all privately connected through one Tailscale tailnet.
 
-**The Windows PC** is on a home network running `tailscale.py`. It has a Tailscale IP of `100.x.x.1` and is visible to every other device in the tailnet.
+**The Windows PC** is on a home network running `tailscale.py`. It has a Tailscale IP of `100.82.151.124` and is visible to every other device in the tailnet.
 
-**The iPhone** is on a completely different network — cellular, a coffee shop, wherever. It has Tailscale installed and logged into the same account. It opens `http://100.x.x.1:5500` in Safari and gets the live scanner UI as if the PC were next door.
+**The iPhone** is on a completely different network — cellular, a coffee shop, wherever. It has Tailscale installed and logged into the same account. It opens the app over Tailscale in Safari and gets the live scanner UI as if the PC were next door.
 
 **The AWS EC2 instance** is a virtual machine in the cloud, added to the tailnet with a single `tailscale up`. It shows up in the scanner's Tailscale interface scan alongside the local LAN devices, even though it's physically in an AWS data centre. That's the point — the tailnet collapses geography.
 
