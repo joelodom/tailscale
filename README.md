@@ -1,6 +1,28 @@
 # NetScope // Tailscale Demo
 
-A live home network scanner you can access from your phone, a coffee shop, or the other side of the world — privately, instantly, with no setup beyond installing Tailscale.
+> **A human + AI collaboration.** This project was built as a pair with [Claude](https://claude.ai) (Anthropic) to demonstrate what Tailscale makes possible. The scanner, the server, the UI, and this README were all written together in conversation — a real example of what human curiosity and AI capability can produce when pointed at an interesting problem.
+
+A live network scanner you can access from your phone, a coffee shop, or the other side of the world — privately, instantly, with no setup beyond installing Tailscale.
+
+---
+
+## Seen in the Wild
+
+*Screenshot taken on iPhone, connected from a different network via Tailscale — scanning the home LAN where the PC is running:*
+
+![NetScope running on iPhone over Tailscale](https://jennings-farmhouse.s3.us-east-1.amazonaws.com/night.jpg)
+
+---
+
+## The Tailnet Behind This Demo
+
+Here's the actual setup used to build and test this — three devices on three different networks, all privately connected through one Tailscale tailnet.
+
+**The Windows PC** is on a home network running `tailscale.py`. It has a Tailscale IP of `100.x.x.1` and is visible to every other device in the tailnet.
+
+**The iPhone** is on a completely different network — cellular, a coffee shop, wherever. It has Tailscale installed and logged into the same account. It opens `http://100.x.x.1:5500` in Safari and gets the live scanner UI as if the PC were next door.
+
+**The AWS EC2 instance** is a virtual machine in the cloud, added to the tailnet with a single `tailscale up`. It shows up in the scanner's Tailscale interface scan alongside the local LAN devices, even though it's physically in an AWS data centre. That's the point — the tailnet collapses geography.
 
 ---
 
@@ -14,9 +36,23 @@ That's the demo. **Tailscale makes your devices behave like they're on the same 
 
 ---
 
+## What Gets Scanned
+
+NetScope scans every network interface on your PC simultaneously:
+
+### Your Home LAN
+Routers, NAS boxes, printers, smart TVs, game consoles, other PCs. The scanner uses TCP connect probes (not ping) so it finds devices that silently drop ICMP — most phones, smart home gear, and anything with a host firewall.
+
+### Your Tailnet
+The Tailscale interface (`100.x.x.x`) is treated as a network just like any other, and NetScope scans a `/24` around your own Tailscale address. Any device on your tailnet — an EC2 instance, a Raspberry Pi, a remote server — appears here right alongside your home router. The EC2 you spun up for this demo shows up in this section.
+
+This is the compelling part: you're scanning a virtual machine running in AWS from your home PC, tunneled privately over WireGuard, discovered the same way as the router plugged into your wall. Tailscale makes it that seamless.
+
+---
+
 ## What You'd Normally Have to Do
 
-To expose a local server to your phone when you're away from home, without Tailscale, you'd need to:
+To expose a local server to your phone when you're away from home, without Tailscale:
 
 1. Log into your router and set up port forwarding
 2. Figure out your home's public IP address (which changes)
@@ -35,72 +71,32 @@ That's the list.
 
 ## How Tailscale Actually Works
 
-When both devices have Tailscale running, they're part of a private mesh network called a **tailnet**. Each device gets a stable `100.x.x.x` IP address that never changes, regardless of what network it's on. Your PC is `100.x.x.x`. Your iPhone is `100.y.y.y`. They can always reach each other.
+When devices have Tailscale running, they're part of a private mesh network called a **tailnet**. Each device gets a stable `100.x.x.x` IP that never changes regardless of which network it's on.
 
-The connection is encrypted with **WireGuard**, which is a modern, audited, extremely lean VPN protocol built into the Linux kernel and available on all major platforms. Tailscale uses WireGuard under the hood for every connection.
-
-To establish the connection between devices that are behind NAT (which is almost everything — home routers, mobile data, coffee shop Wi-Fi), Tailscale uses a coordination server to introduce devices to each other, then tries to establish a **direct peer-to-peer link** using techniques similar to WebRTC. In most cases, the two devices end up talking directly to each other — Tailscale's servers are only involved in the handshake. If a direct path isn't possible (very strict firewalls), traffic routes through Tailscale's **DERP relay servers**, still end-to-end encrypted so Tailscale can't read it.
-
-The result is that from your iPhone's perspective, your home PC is just a device at `100.x.x.x` that it can reach with ordinary HTTP. No different from being on the same Wi-Fi.
+Connections are encrypted with **WireGuard**. Tailscale's coordination server introduces devices to each other, then they establish a **direct peer-to-peer link** using NAT traversal — no traffic through Tailscale's servers after the handshake. If a direct path is blocked, traffic routes through Tailscale's **DERP relay servers**, still end-to-end encrypted.
 
 ---
 
-## Running the Demo
+## How the Scanner Works
 
-### 1. Install Tailscale
+**Discovery:** Each IP is probed against ~24 canary ports (HTTP, SSH, SMB, RDP, printers, iOS sync, MQTT, databases). No ping — TCP only, so devices that silently drop ICMP still get found.
 
-Download and install Tailscale on your Windows PC: [tailscale.com/download](https://tailscale.com/download)
+**Port scan:** Every live host gets ports 1–10,000 plus curated high ports (~10,030 total) scanned in parallel.
 
-Sign in. That's it — the service starts automatically and your PC joins your tailnet.
+**Banner grab:** Each open port is read for its opening message — SSH, FTP, SMTP, Redis, and many others announce their software and version on connect.
 
-### 2. Install Tailscale on your iPhone
+**Live progress:** Each interface gets its own panel with a discovery progress bar and per-host port-scan progress bars ticking up in real time.
 
-Install the Tailscale app from the App Store. Sign in with the same account. Your iPhone now appears in your tailnet alongside your PC.
+---
 
-### 3. Find your PC's Tailscale IP
-
-Open the Tailscale system tray icon, or go to [login.tailscale.com/admin/machines](https://login.tailscale.com/admin/machines). Your PC will have a `100.x.x.x` address listed.
-
-### 4. Install the one Python dependency and run
+## Setup
 
 ```powershell
 pip install flask
 python tailscale.py
 ```
 
-### 5. Open it on your iPhone
-
-In Safari, navigate to:
-
-```
-http://100.x.x.x:5500
-```
-
-(Replace with your actual Tailscale IP.)
-
-It works. From anywhere. No router config. No firewall rules. No port forwarding.
-
----
-
-## What the App Does
-
-Hit **Scan Network** and the server scans your home LAN in real time:
-
-- **Ping sweep** — finds all live hosts on the subnet
-- **Port scan** — probes the 150 most common TCP ports per host, in parallel
-- **Banner grab** — reads each open service's opening message (reveals software names and versions for SSH, FTP, SMTP, Redis, and many others)
-- **Reverse DNS** — resolves hostnames where available
-- **Device type guess** — infers what kind of device it is from the combination of open ports and hostname
-
-Results stream to your phone live as each host is finished — you don't wait for the whole scan to complete.
-
-The scanner uses only Python's standard library. No nmap, no third-party network libraries.
-
----
-
-## Security Note
-
-This server has no authentication. Anyone in your tailnet can reach it. For a personal demo that's fine. If you share your tailnet with others, Tailscale's ACL system (in the admin panel) lets you restrict which devices can reach which others.
+Open `http://<your-tailscale-ip>:5500` on any tailnet device. Find your Tailscale IP at [login.tailscale.com/admin/machines](https://login.tailscale.com/admin/machines).
 
 ---
 
@@ -110,3 +106,9 @@ This server has no authentication. Anyone in your tailnet can reach it. For a pe
 tailscale.py   — the entire application (server + scanner + UI)
 README.md      — this file
 ```
+
+---
+
+## Security Note
+
+No authentication is implemented. Anyone in your tailnet can reach the dashboard. Tailscale's ACL system in the admin panel lets you restrict access per-device if needed.
