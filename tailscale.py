@@ -1,36 +1,20 @@
 #!/usr/bin/env python3
 """
-tailscale.py  —  NetScope: Home Network Dashboard over Tailscale
-================================================================
+tailscale.py  —  NetScope: Home Network Dashboard
+==================================================
 
-This script does three things, in order:
+A live home network scanner served as a local web app.
+Run this, then open it from any device on your Tailscale network.
 
-  1. TAILSCALE  — Launches tailscaled.exe and tailscale.exe directly as child
-                  processes (no Windows service, no installation). Connects to
-                  your tailnet, discovers this machine's 100.x.x.x Tailscale
-                  IP by talking to the daemon over its Windows named pipe.
-
-  2. SERVER     — Binds a Flask web server to BOTH 127.0.0.1 (localhost) and
-                  the Tailscale IP. Nothing else. No public exposure.
-
-  3. SCANNER    — On demand, scans the local LAN using only Python stdlib:
-                  concurrent TCP connect probes for ports, ICMP ping via
-                  subprocess, and reverse DNS. No nmap, no third-party
-                  network libraries.
+No Tailscale-specific code here — Tailscale handles the networking
+transparently. This is just a web server that binds to 0.0.0.0.
 
 Requirements:
-    pip install flask pywin32
-
-  Place these two files in the same folder as this script:
-    tailscaled.exe   (Tailscale daemon)
-    tailscale.exe    (Tailscale CLI)
-  Both from: https://pkgs.tailscale.com/stable/#windows-amd64
+    pip install flask
 
 Usage:
     python tailscale.py
-
-  On first run, a browser window opens for Tailscale login.
-  Subsequent runs re-use saved state in ./tailscale-state/.
+    Then open http://<your-tailscale-ip>:5500 on any tailnet device.
 """
 
 import concurrent.futures
@@ -39,7 +23,6 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import threading
 import time
 from datetime import datetime
@@ -52,18 +35,6 @@ from flask import Flask, Response, stream_with_context
 # ─────────────────────────────────────────────────────────────────────────────
 
 PORT = 5500
-
-SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
-TAILSCALED_EXE = os.path.join(SCRIPT_DIR, "tailscaled.exe")
-TAILSCALE_EXE  = os.path.join(SCRIPT_DIR, "tailscale.exe")
-
-# Where tailscaled stores its keys and node identity between runs.
-# Keep this folder and you stay logged in without re-authenticating.
-STATE_DIR = os.path.join(SCRIPT_DIR, "tailscale-state")
-
-# Windows named pipe used by tailscaled's LocalAPI.
-# This is identical to the pipe the official Tailscale GUI uses internally.
-TS_PIPE = r"\\.\pipe\ProtectedPrefix\Administrators\Tailscale\tailscaled"
 
 # Scanner tuning
 TOP_PORTS    = 150   # how many common ports to probe per host
@@ -86,7 +57,7 @@ COMMON_PORTS = list(dict.fromkeys([
     2049, 111, 2121, 990, 993, 995, 587, 465, 2525, 1025,
     1521, 5984, 7474, 9300, 15672, 5672, 4369, 61616, 8161, 61613,
     6443, 2379, 2380, 10250, 10255, 30000, 32000, 2375, 2376,
-    7000, 7001, 7199, 9042, 9160, 8086, 8087, 1883, 8883, 5683,
+    7199, 9042, 9160, 8086, 8087, 1883, 8883, 5683,
     502, 102, 20000, 44818, 5900, 5901, 5902, 5903, 6881, 6969,
     7070, 8554, 9001, 9002, 9003, 32400, 8096, 8920, 51413,
 ]))[:TOP_PORTS]
@@ -112,161 +83,6 @@ PORT_NAMES = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tailscale process management
-# ─────────────────────────────────────────────────────────────────────────────
-
-_tailscaled_proc = None
-
-
-def check_binaries():
-    """Make sure the portable Tailscale binaries exist before going further."""
-    missing = [f for f in [TAILSCALED_EXE, TAILSCALE_EXE] if not os.path.isfile(f)]
-    if missing:
-        print("\n[!] Missing Tailscale binaries:")
-        for f in missing:
-            print(f"      {f}")
-        print("\n    Download from: https://pkgs.tailscale.com/stable/#windows-amd64")
-        print("    Place tailscaled.exe and tailscale.exe next to this script.\n")
-        sys.exit(1)
-
-
-def start_tailscaled():
-    """
-    Launch tailscaled.exe as a child process — no Windows service involved.
-
-    --tun=userspace-networking
-        Tells tailscaled to implement the WireGuard tunnel entirely inside
-        its own process instead of creating a kernel TUN/TAP adapter.
-        This means:
-          • No new network interface appears in ipconfig
-          • No admin rights required for the network driver
-          • The daemon is genuinely self-contained
-
-    --statedir=./tailscale-state
-        All keys, node certificates, and auth tokens go in this local folder.
-        Delete it and you're a fresh node. Keep it and you stay logged in.
-
-    --port=0
-        Let the OS choose a UDP port for WireGuard peer-to-peer traffic.
-    """
-    global _tailscaled_proc
-    os.makedirs(STATE_DIR, exist_ok=True)
-
-    print("[tailscale] Launching tailscaled.exe in userspace mode…")
-    _tailscaled_proc = subprocess.Popen(
-        [
-            TAILSCALED_EXE,
-            "--tun=userspace-networking",
-            f"--statedir={STATE_DIR}",
-            "--port=0",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-    print(f"[tailscale] tailscaled.exe running (pid {_tailscaled_proc.pid})")
-
-    # Wait for the named pipe to appear before we try to use the LocalAPI
-    print("[tailscale] Waiting for daemon to initialise…", end="", flush=True)
-    for _ in range(20):
-        time.sleep(0.5)
-        try:
-            import win32file
-            h = win32file.CreateFile(
-                TS_PIPE, win32file.GENERIC_READ, 0, None,
-                win32file.OPEN_EXISTING, 0, None
-            )
-            win32file.CloseHandle(h)
-            print(" ready.")
-            return
-        except Exception:
-            print(".", end="", flush=True)
-    print(" timed out — proceeding anyway.")
-
-
-def bring_tailscale_up():
-    """
-    Run 'tailscale up' to connect to the tailnet.
-
-    First run: opens a browser for login (one-time).
-    Subsequent runs: state in STATE_DIR means silent reconnect.
-
-    We pass --socket to point the CLI at our specific daemon instance
-    rather than any system-installed Tailscale that might also be running.
-    """
-    print("[tailscale] Running 'tailscale up' to connect…")
-    result = subprocess.run(
-        [TAILSCALE_EXE, "--socket", TS_PIPE, "up"],
-        capture_output=True, text=True, timeout=120,
-    )
-    if result.returncode != 0:
-        print(f"[tailscale] Warning — 'tailscale up' exited non-zero:\n{result.stderr.strip()}")
-    else:
-        print("[tailscale] Connected to tailnet ✓")
-
-
-def get_tailscale_ip() -> str | None:
-    """
-    Query tailscaled's LocalAPI over the Windows named pipe to learn our
-    Tailscale IP address (the 100.x.x.x address assigned to this node).
-
-    The LocalAPI is plain HTTP/1.1 spoken over a named pipe — the exact
-    same protocol the Tailscale GUI uses. We open the pipe with win32file,
-    write a raw HTTP GET request, read the response, and parse the JSON.
-
-    No network packets leave the machine. This is purely local IPC.
-    """
-    try:
-        import win32file
-
-        pipe = win32file.CreateFile(
-            TS_PIPE,
-            win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-            0, None, win32file.OPEN_EXISTING, 0, None,
-        )
-
-        # Plain HTTP/1.0 request — tailscaled speaks it natively over the pipe
-        req = b"GET /localapi/v0/status HTTP/1.0\r\nHost: local-tailscaled.sock\r\n\r\n"
-        win32file.WriteFile(pipe, req)
-
-        buf = b""
-        while True:
-            try:
-                _, chunk = win32file.ReadFile(pipe, 65536)
-                if not chunk:
-                    break
-                buf += chunk
-            except Exception:
-                break
-        win32file.CloseHandle(pipe)
-
-        # Split off HTTP headers
-        body = buf.split(b"\r\n\r\n", 1)[-1]
-        data = json.loads(body.decode("utf-8"))
-
-        for addr in data.get("Self", {}).get("TailscaleIPs", []):
-            if addr.startswith("100."):   # Tailscale CGNAT space
-                return addr
-
-    except ImportError:
-        print("[tailscale] ERROR: pywin32 not installed. Run: pip install pywin32")
-    except Exception as e:
-        print(f"[tailscale] Could not query LocalAPI: {e}")
-    return None
-
-
-def stop_tailscaled():
-    """Terminate tailscaled when the script exits."""
-    if _tailscaled_proc:
-        print("\n[tailscale] Shutting down tailscaled…")
-        _tailscaled_proc.terminate()
-        try:
-            _tailscaled_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _tailscaled_proc.kill()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Network scanner — Python stdlib only
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -287,15 +103,15 @@ def get_local_subnet() -> str:
 
 def ping_host(ip: str) -> float | None:
     """
-    Ping a host once using the Windows 'ping' command.
-    Returns RTT in milliseconds, or None if no reply.
-
-    We use subprocess ping rather than raw ICMP sockets because raw sockets
-    require admin privileges on Windows. ping.exe works for any user.
+    Ping a host once. Returns RTT in milliseconds, or None if no reply.
+    Uses the system ping command to avoid needing raw socket privileges.
+    Handles both Windows (-n) and Unix (-c) flags automatically.
     """
+    flag = "-n" if os.name == "nt" else "-c"
+    timeout_flag = ["-w", "800"] if os.name == "nt" else ["-W", "1"]
     try:
         r = subprocess.run(
-            ["ping", "-n", "1", "-w", "800", ip],
+            ["ping", flag, "1"] + timeout_flag + [ip],
             capture_output=True, text=True, timeout=3,
         )
         for line in r.stdout.splitlines():
@@ -324,8 +140,8 @@ def resolve_hostname(ip: str) -> str:
 def probe_port(ip: str, port: int) -> bool:
     """
     Attempt a TCP connection to ip:port.
-    Returns True if the port is open (SYN-ACK received), False otherwise.
-    No data is sent — we close immediately after the handshake.
+    Returns True if open (connection accepted), False otherwise.
+    No data is sent — just the handshake.
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -337,10 +153,9 @@ def probe_port(ip: str, port: int) -> bool:
 
 def grab_banner(ip: str, port: int) -> str:
     """
-    Connect to an open port and read the server's opening message.
-    Many protocols (SSH, FTP, SMTP, Redis, …) announce themselves
-    immediately on connect, which reveals software and version info.
-    For HTTP we send a minimal HEAD request to get a response line.
+    Read the opening message from a service on a known-open port.
+    Many protocols (SSH, FTP, SMTP, Redis, etc.) announce themselves
+    immediately on connect. For HTTP we send a minimal HEAD request.
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -355,7 +170,7 @@ def grab_banner(ip: str, port: int) -> str:
 
 
 def get_service_name(port: int) -> str:
-    """Human-readable name for a port: check our dict, then stdlib."""
+    """Human-readable name for a port number."""
     if port in PORT_NAMES:
         return PORT_NAMES[port]
     try:
@@ -366,8 +181,8 @@ def get_service_name(port: int) -> str:
 
 def scan_ports(ip: str) -> list[dict]:
     """
-    Probe COMMON_PORTS on one host in parallel, then grab banners from
-    all open ports. Returns a sorted list of open-port dicts.
+    Probe all COMMON_PORTS on one host in parallel, then grab banners
+    from each open port. Returns a sorted list of open-port dicts.
     """
     open_ports = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=PORT_WORKERS) as ex:
@@ -395,30 +210,30 @@ def guess_device_type(hostname: str, ports: list[dict]) -> str:
     ps = {p["port"] for p in ports}
     h  = hostname.lower()
 
-    if 3389 in ps:                          return "Windows PC / Server"
-    if 5985 in ps or 5986 in ps:           return "Windows (WinRM)"
-    if 32400 in ps:                         return "Plex Media Server"
-    if 8096 in ps:                          return "Jellyfin Media Server"
-    if {80, 443} <= ps and 22 in ps:       return "Linux Web Server"
-    if {80, 443} <= ps:                     return "Web Server / Router / NAS"
-    if 22 in ps and 445 not in ps:         return "Linux / Unix Server"
-    if 445 in ps:                           return "Windows File Server"
-    if 3306 in ps:                          return "MySQL Server"
-    if 5432 in ps:                          return "PostgreSQL Server"
-    if 27017 in ps:                         return "MongoDB Server"
-    if 6379 in ps:                          return "Redis Server"
-    if 5900 in ps:                          return "VNC Server"
-    if 1883 in ps:                          return "IoT / MQTT Broker"
-    if 9090 in ps or 9200 in ps:           return "Monitoring / Search"
-    if any(x in h for x in ["router","gateway","modem","fritz","dsl"]):
+    if 3389 in ps:                    return "Windows PC / Server"
+    if 5985 in ps or 5986 in ps:     return "Windows (WinRM)"
+    if 32400 in ps:                   return "Plex Media Server"
+    if 8096 in ps:                    return "Jellyfin Media Server"
+    if {80, 443} <= ps and 22 in ps: return "Linux Web Server"
+    if {80, 443} <= ps:               return "Web Server / Router / NAS"
+    if 22 in ps and 445 not in ps:   return "Linux / Unix Server"
+    if 445 in ps:                     return "Windows File Server"
+    if 3306 in ps:                    return "MySQL Server"
+    if 5432 in ps:                    return "PostgreSQL Server"
+    if 27017 in ps:                   return "MongoDB Server"
+    if 6379 in ps:                    return "Redis Server"
+    if 5900 in ps:                    return "VNC Server"
+    if 1883 in ps:                    return "IoT / MQTT Broker"
+    if 9090 in ps or 9200 in ps:     return "Monitoring / Search"
+    if any(x in h for x in ["router", "gateway", "modem", "fritz", "dsl"]):
         return "Router / Gateway"
-    if any(x in h for x in ["tv","chromecast","roku","fire","appletv"]):
+    if any(x in h for x in ["tv", "chromecast", "roku", "fire", "appletv"]):
         return "Smart TV / Streaming"
-    if any(x in h for x in ["phone","android","iphone","ipad"]):
+    if any(x in h for x in ["phone", "android", "iphone", "ipad"]):
         return "Mobile Device"
-    if any(x in h for x in ["printer","hp","canon","epson","brother"]):
+    if any(x in h for x in ["printer", "hp", "canon", "epson", "brother"]):
         return "Printer"
-    if any(x in h for x in ["cam","camera","nvr","dvr"]):
+    if any(x in h for x in ["cam", "camera", "nvr", "dvr"]):
         return "IP Camera / NVR"
     return "Unknown"
 
@@ -427,9 +242,9 @@ def scan_network(subnet: str):
     """
     Generator that scans the LAN and yields Server-Sent Events.
 
-    Phase 1 — Parallel ping sweep to find live hosts quickly.
-    Phase 2 — Per-host: port scan + banner grab + DNS + type guess,
-               run HOST_WORKERS hosts at a time.
+    Phase 1 — Parallel ping sweep to find live hosts.
+    Phase 2 — Per-host port scan, banner grab, DNS, and type guess,
+               running HOST_WORKERS hosts simultaneously.
     """
 
     # ── Phase 1: ping sweep ──────────────────────────────────────────────────
@@ -644,9 +459,9 @@ HTML = r"""<!DOCTYPE html>
 <div class="hero">
   <h1>Your Home Network,<br><em>Anywhere.</em></h1>
   <p>
-    This page is served privately over your Tailscale mesh —
-    encrypted end-to-end with WireGuard, reachable only by your
-    devices, accessible from anywhere without opening a router port.
+    Scan your home network from anywhere in the world —
+    delivered privately over Tailscale with no port forwarding,
+    no firewall rules, and no configuration.
   </p>
   <button id="scanBtn" onclick="startScan()">⬡ Scan Network</button>
 </div>
@@ -678,13 +493,13 @@ function startScan() {
   evtSrc.addEventListener('done', e => {
     const d = JSON.parse(e.data);
     document.getElementById('progBar').style.width = '100%';
-    status('✓ '+d.msg);
+    status('✓ ' + d.msg);
     document.getElementById('scanBtn').disabled = false;
     evtSrc.close();
     const s = document.getElementById('summary');
     s.style.display = 'block';
     s.innerHTML = `Completed in <strong>${((Date.now()-t0)/1000).toFixed(1)}s</strong> — `+
-      `<strong>${devCount}</strong> device(s) on your LAN, `+
+      `<strong>${devCount}</strong> device(s) found, `+
       `delivered privately over <strong>Tailscale</strong>.`;
   });
   evtSrc.addEventListener('error', e => {
@@ -746,8 +561,8 @@ def index():
 def scan():
     """
     SSE stream endpoint. Keeps the HTTP connection open and pushes JSON
-    events for each scan update. The browser EventSource API handles
-    reconnection automatically — no polling needed.
+    events as each device is discovered. The browser EventSource API
+    handles this natively — no polling, no page reloads.
     """
     subnet = get_local_subnet()
 
@@ -766,50 +581,9 @@ def scan():
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_server(host: str, label: str):
-    print(f"  [{label:<10}]  http://{host}:{PORT}")
-    app.run(host=host, port=PORT, threaded=True, use_reloader=False)
-
-
 if __name__ == "__main__":
-    import atexit
-    atexit.register(stop_tailscaled)
-
-    print("\n╔══════════════════════════════════════════╗")
-    print("║  NetScope // Tailscale Demo              ║")
-    print("╚══════════════════════════════════════════╝\n")
-
-    check_binaries()
-    start_tailscaled()
-    bring_tailscale_up()
-
-    print("\n[tailscale] Querying LocalAPI for Tailscale IP…")
-    ts_ip = get_tailscale_ip()
-
-    threads = []
-    print("\n[server] Starting on:")
-
-    t1 = threading.Thread(target=run_server, args=("127.0.0.1", "localhost"), daemon=True)
-    threads.append(t1)
-
-    if ts_ip:
-        print(f"  Tailscale IP detected: {ts_ip}")
-        t2 = threading.Thread(target=run_server, args=(ts_ip, "tailscale"), daemon=True)
-        threads.append(t2)
-    else:
-        print("  [!] Tailscale IP not found — localhost only.")
-
-    for t in threads:
-        t.start()
-
-    print("\n  Open in your browser:\n")
-    print(f"    http://127.0.0.1:{PORT}         (this PC)")
-    if ts_ip:
-        print(f"    http://{ts_ip}:{PORT}  (any Tailscale device — including your iPhone)")
-    print("\n  Press Ctrl+C to stop.\n")
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
+    print(f"\n  NetScope running on http://0.0.0.0:{PORT}")
+    print(f"  If Tailscale is running, open http://<your-tailscale-ip>:{PORT}")
+    print(  "  from any device on your tailnet.\n")
+    print(  "  Press Ctrl+C to stop.\n")
+    app.run(host="0.0.0.0", port=PORT, threaded=True)

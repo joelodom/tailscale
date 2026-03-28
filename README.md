@@ -1,202 +1,112 @@
 # NetScope // Tailscale Demo
 
-A home network scanner served privately over Tailscale — accessible from your iPhone (or any device) anywhere in the world, with no router configuration, no open ports, and no system-level Tailscale installation.
-
-## Credit Where it's Due
-
-The initial version of this was created in collaboration with Claude.
+A live home network scanner you can access from your phone, a coffee shop, or the other side of the world — privately, instantly, with no setup beyond installing Tailscale.
 
 ---
 
-## What This Actually Demonstrates
+## The Point of This Demo
 
-This project is less about network scanning and more about **how Tailscale works as a connectivity layer**. The scanner is just a reason to have something interesting to look at on your phone. The real demo is the Tailscale part.
+This is a totally ordinary Python web server. It binds to `0.0.0.0`, serves an HTML page, and streams scan results over HTTP. There is nothing in the code about Tailscale. No special libraries, no API calls, no configuration.
 
----
+And yet, the moment Tailscale is running on your PC and your iPhone, you can open this app from your phone from anywhere on the planet as if both devices were sitting on the same desk.
 
-## The Tailscale Architecture
-
-### No Installation, No Service
-
-Most Tailscale setups install a Windows service (`tailscaled.exe`) that runs in the background at all times. This project skips that entirely.
-
-Instead, `tailscale.py` launches `tailscaled.exe` **directly as a child process**, and when the Python script stops, so does Tailscale. There is no installer, no Windows service entry, no system tray icon, and no entries in `services.msc`. The entire Tailscale node lives and dies with the Python process.
-
-```
-python tailscale.py
-    │
-    ├── spawns ──► tailscaled.exe  (Tailscale daemon, no service)
-    │                   │
-    │                   └── speaks WireGuard to your tailnet peers
-    │
-    └── spawns ──► tailscale.exe up  (authenticates, then exits)
-```
-
-### Userspace Networking Mode
-
-Normally, Tailscale creates a virtual network adapter — a TUN device. On Windows you'd see a new `Tailscale` interface in `ipconfig`. That interface lets every application on the machine reach your tailnet transparently.
-
-This project uses `--tun=userspace-networking`, which changes the model entirely:
-
-```
-Normal Tailscale:
-  [App] → [OS network stack] → [Tailscale TUN adapter] → [WireGuard] → [Peer]
-                                      ↑
-                              visible in ipconfig
-                              routes all traffic
-
-Userspace Tailscale (this project):
-  [Flask server] → [bound to Tailscale IP] → [WireGuard in tailscaled.exe] → [Peer]
-                         ↑
-                    only this process
-                    nothing else uses it
-```
-
-In userspace mode, Tailscale implements the entire WireGuard tunnel inside the `tailscaled.exe` process. No kernel driver is involved. Nothing in `ipconfig` changes. No other application on the PC can route traffic through the Tailscale network — only the services that explicitly bind to the Tailscale IP address can be reached.
-
-This is a meaningful security distinction: the surface area exposed through Tailscale is exactly and only the Flask server on port 5500.
-
-### Portable State Directory
-
-The Tailscale node's identity — its private key, auth tokens, and peer certificates — is stored in `./tailscale-state/` rather than `C:\ProgramData\Tailscale`. This makes the whole setup self-contained and portable.
-
-```
-NetScope/
-├── tailscale.py
-├── tailscale.exe
-├── tailscaled.exe
-└── tailscale-state/       ← node identity, keys, auth tokens
-    ├── tailscaled.state
-    └── ...
-```
-
-First run: `tailscale-state/` is empty, so the node authenticates from scratch (browser login). Subsequent runs: the saved state means silent reconnect — no login required.
-
-Delete `tailscale-state/` and the node starts fresh with a new identity.
-
-### The LocalAPI Named Pipe
-
-After `tailscaled.exe` starts, Python needs to know what Tailscale IP was assigned to this node. It gets this by talking to tailscaled's **LocalAPI** — a plain HTTP/1.1 API served over a Windows named pipe.
-
-```python
-# Open the named pipe
-pipe = win32file.CreateFile(
-    r"\\.\pipe\ProtectedPrefix\Administrators\Tailscale\tailscaled",
-    GENERIC_READ | GENERIC_WRITE, ...
-)
-
-# Send a plain HTTP request over it
-win32file.WriteFile(pipe, b"GET /localapi/v0/status HTTP/1.0\r\n...")
-
-# Parse the JSON response
-data = json.loads(response_body)
-ts_ip = data["Self"]["TailscaleIPs"][0]   # → "100.x.x.x"
-```
-
-This is the same pipe the official Tailscale GUI and CLI use. It never leaves the machine — it's local IPC, not a network call. The `pywin32` library (the only dependency beyond Flask) gives Python access to the Win32 named pipe API.
-
-### Binding Flask to the Tailscale IP
-
-Once the Tailscale IP is known, Flask is bound to two addresses in parallel threads:
-
-```python
-# Always available for local testing
-threading.Thread(target=app.run, kwargs={"host": "127.0.0.1", "port": 5500}).start()
-
-# Only reachable through Tailscale
-threading.Thread(target=app.run, kwargs={"host": "100.x.x.x", "port": 5500}).start()
-```
-
-This means:
-
-| Address | Reachable from |
-|---|---|
-| `http://127.0.0.1:5500` | This PC only |
-| `http://100.x.x.x:5500` | Any device on your tailnet |
-| `http://<public-home-IP>:5500` | **Nobody** — not exposed |
-| Any device on your Wi-Fi (not in tailnet) | **Nobody** |
-
-The router is never involved. No port is opened. The only path to the server is through Tailscale's encrypted WireGuard tunnel.
-
-### How Your iPhone Connects
-
-When you open `http://100.x.x.x:5500` in Safari on your iPhone (which has Tailscale installed and logged in to the same account):
-
-```
-iPhone (Tailscale running)
-    │
-    │  WireGuard encrypted UDP packet
-    │  (direct peer-to-peer if possible,
-    │   or via Tailscale DERP relay if NAT blocks it)
-    ▼
-Your PC (tailscaled.exe running in userspace mode)
-    │
-    │  decrypts packet, routes to Flask
-    ▼
-Flask server → HTML response → back through WireGuard → your iPhone
-```
-
-Tailscale handles NAT traversal automatically using the same techniques as WebRTC (STUN/TURN). If a direct UDP path exists between your iPhone and PC, it uses that. If NAT blocks it (e.g., a strict corporate firewall), traffic routes through Tailscale's DERP relay servers — still end-to-end encrypted, just with a relay in the middle.
-
-Either way, the connection works from anywhere: your home network, a coffee shop, a hotel, a cellular connection.
+That's the demo. **Tailscale makes your devices behave like they're on the same local network, no matter where they are, and your code doesn't have to do a thing.**
 
 ---
 
-## Setup
+## What You'd Normally Have to Do
 
-### 1. Download the Tailscale binaries
+To expose a local server to your phone when you're away from home, without Tailscale, you'd need to:
 
-Go to [pkgs.tailscale.com/stable/#windows-amd64](https://pkgs.tailscale.com/stable/#windows-amd64) and download the latest Windows AMD64 zip. Extract `tailscaled.exe` and `tailscale.exe` into the same folder as `tailscale.py`.
+1. Log into your router and set up port forwarding
+2. Figure out your home's public IP address (which changes)
+3. Set up dynamic DNS so you have a stable hostname
+4. Hope your ISP doesn't block inbound connections
+5. Open a firewall hole and accept the exposure to the public internet
+6. Do it all again if you move or change ISPs
 
-### 2. Install Python dependencies
+With Tailscale:
+
+1. Install Tailscale on both devices and sign in
+
+That's the list.
+
+---
+
+## How Tailscale Actually Works
+
+When both devices have Tailscale running, they're part of a private mesh network called a **tailnet**. Each device gets a stable `100.x.x.x` IP address that never changes, regardless of what network it's on. Your PC is `100.x.x.x`. Your iPhone is `100.y.y.y`. They can always reach each other.
+
+The connection is encrypted with **WireGuard**, which is a modern, audited, extremely lean VPN protocol built into the Linux kernel and available on all major platforms. Tailscale uses WireGuard under the hood for every connection.
+
+To establish the connection between devices that are behind NAT (which is almost everything — home routers, mobile data, coffee shop Wi-Fi), Tailscale uses a coordination server to introduce devices to each other, then tries to establish a **direct peer-to-peer link** using techniques similar to WebRTC. In most cases, the two devices end up talking directly to each other — Tailscale's servers are only involved in the handshake. If a direct path isn't possible (very strict firewalls), traffic routes through Tailscale's **DERP relay servers**, still end-to-end encrypted so Tailscale can't read it.
+
+The result is that from your iPhone's perspective, your home PC is just a device at `100.x.x.x` that it can reach with ordinary HTTP. No different from being on the same Wi-Fi.
+
+---
+
+## Running the Demo
+
+### 1. Install Tailscale
+
+Download and install Tailscale on your Windows PC: [tailscale.com/download](https://tailscale.com/download)
+
+Sign in. That's it — the service starts automatically and your PC joins your tailnet.
+
+### 2. Install Tailscale on your iPhone
+
+Install the Tailscale app from the App Store. Sign in with the same account. Your iPhone now appears in your tailnet alongside your PC.
+
+### 3. Find your PC's Tailscale IP
+
+Open the Tailscale system tray icon, or go to [login.tailscale.com/admin/machines](https://login.tailscale.com/admin/machines). Your PC will have a `100.x.x.x` address listed.
+
+### 4. Install the one Python dependency and run
 
 ```powershell
-pip install flask pywin32
-```
-
-`flask` — serves the web UI.  
-`pywin32` — provides access to the Windows named pipe API so Python can talk to tailscaled's LocalAPI.
-
-Everything else (network scanning, JSON, threading, subprocess) is Python stdlib.
-
-### 3. Install Tailscale on your iPhone
-
-Download the Tailscale app from the App Store and sign in with the same account you'll use on your PC. Both devices need to be on the same tailnet.
-
-### 4. Run
-
-```powershell
+pip install flask
 python tailscale.py
 ```
 
-On first run, a browser window opens for Tailscale login. Sign in once and subsequent runs connect silently.
+### 5. Open it on your iPhone
 
-The terminal will print two URLs when ready:
+In Safari, navigate to:
 
 ```
-  [localhost  ]  http://127.0.0.1:5500
-  [tailscale  ]  http://100.101.102.103:5500
+http://100.x.x.x:5500
 ```
 
-Open the second URL in Safari on your iPhone.
+(Replace with your actual Tailscale IP.)
+
+It works. From anywhere. No router config. No firewall rules. No port forwarding.
 
 ---
 
-## File Layout
+## What the App Does
 
-```
-NetScope/
-├── tailscale.py          ← the whole application
-├── tailscale.exe         ← Tailscale CLI (you provide)
-├── tailscaled.exe        ← Tailscale daemon (you provide)
-├── tailscale-state/      ← created on first run, keeps you logged in
-└── README.md
-```
+Hit **Scan Network** and the server scans your home LAN in real time:
+
+- **Ping sweep** — finds all live hosts on the subnet
+- **Port scan** — probes the 150 most common TCP ports per host, in parallel
+- **Banner grab** — reads each open service's opening message (reveals software names and versions for SSH, FTP, SMTP, Redis, and many others)
+- **Reverse DNS** — resolves hostnames where available
+- **Device type guess** — infers what kind of device it is from the combination of open ports and hostname
+
+Results stream to your phone live as each host is finished — you don't wait for the whole scan to complete.
+
+The scanner uses only Python's standard library. No nmap, no third-party network libraries.
 
 ---
 
-## Security Notes
+## Security Note
 
-- **No authentication** is implemented. Anyone in your tailnet can reach the dashboard. For a personal demo this is fine; for anything shared, add HTTP Basic Auth.
-- The scanner uses TCP connect probes and ICMP ping — normal, non-destructive discovery. Only scan networks you own or have permission to scan.
-- Tailscale's access controls (ACLs) in the admin panel let you restrict which tailnet devices can reach which others, if needed.
+This server has no authentication. Anyone in your tailnet can reach it. For a personal demo that's fine. If you share your tailnet with others, Tailscale's ACL system (in the admin panel) lets you restrict which devices can reach which others.
+
+---
+
+## Files
+
+```
+tailscale.py   — the entire application (server + scanner + UI)
+README.md      — this file
+```
