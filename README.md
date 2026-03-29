@@ -1,6 +1,6 @@
 # NetScope // Tailscale Demo
 
-> **Credit where due** This project was built as a pair with [Claude](https://claude.ai) (Anthropic) to demonstrate what Tailscale makes possible.
+> **Credit where due** This project was built in collaboration with [Claude](https://claude.ai) (Anthropic) to demonstrate what Tailscale makes possible.
 
 This is live network scanner you can access from your phone, a coffee shop, or the other side of the world — privately, instantly, with no setup beyond installing Tailscale.
 
